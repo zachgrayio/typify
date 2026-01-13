@@ -7,7 +7,7 @@ use crate::type_entry::{
     EnumTagType, TypeEntry, TypeEntryDetails, TypeEntryEnum, TypeEntryNewtype, TypeEntryStruct,
     Variant, VariantDetails,
 };
-use crate::util::{all_mutually_exclusive, ref_key, StringValidator};
+use crate::util::{all_mutually_exclusive, any_schema_is_non_flattenable, ref_key, StringValidator};
 use log::{debug, info};
 use schemars::schema::{
     ArrayValidation, InstanceType, Metadata, ObjectValidation, Schema, SchemaObject, SingleOrVec,
@@ -1462,6 +1462,12 @@ impl TypeSpace {
         // one of them can match.
         if all_mutually_exclusive(subschemas, &self.definitions) {
             self.convert_one_of(type_name, original_schema, metadata, subschemas)
+        } else if any_schema_is_non_flattenable(subschemas, &self.definitions) {
+            // If any subschema is a primitive type (string enum, number, etc.),
+            // we cannot use flattened struct because serde's #[serde(flatten)]
+            // only works with struct/map-like types. Use untagged enum instead.
+            let type_entry = self.untagged_enum(type_name, original_schema, metadata, subschemas)?;
+            Ok((type_entry, metadata))
         } else {
             // We'll want to build a struct that looks like this:
             // struct Name {

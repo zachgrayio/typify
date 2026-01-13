@@ -58,6 +58,104 @@ pub(crate) fn all_mutually_exclusive(
         })
 }
 
+/// Check if any of the subschemas would generate a non-flattenable type.
+///
+/// Serde's `#[serde(flatten)]` attribute only works correctly for struct/map-like
+/// types. Primitive types like string enums, numbers, booleans cannot be flattened.
+/// When an `anyOf` contains such types, we should use an untagged enum instead of
+/// a struct with flattened fields.
+pub(crate) fn any_schema_is_non_flattenable(
+    subschemas: &[Schema],
+    definitions: &BTreeMap<RefKey, Schema>,
+) -> bool {
+    subschemas
+        .iter()
+        .any(|schema| schema_is_non_flattenable(resolve(schema, definitions), definitions))
+}
+
+/// Check if a schema would generate a type that cannot be flattened with serde.
+/// Returns true for primitive types (strings, numbers, booleans, string enums).
+fn schema_is_non_flattenable(schema: &Schema, definitions: &BTreeMap<RefKey, Schema>) -> bool {
+    match schema {
+        Schema::Bool(_) => false, // Schema::Bool(true) matches any, false matches none
+
+        // String enum (e.g., stringWaitStep) - check this BEFORE the general primitive case
+        Schema::Object(SchemaObject {
+            instance_type: Some(SingleOrVec::Single(instance_type)),
+            enum_values: Some(_),
+            object: None,
+            subschemas: None,
+            ..
+        }) if instance_type.as_ref() == &InstanceType::String => true,
+
+        // General primitive types without object structure cannot be flattened
+        Schema::Object(SchemaObject {
+            instance_type: Some(SingleOrVec::Single(instance_type)),
+            object: None,
+            subschemas: None,
+            ..
+        }) => {
+            // Primitive types without object structure cannot be flattened
+            matches!(
+                instance_type.as_ref(),
+                InstanceType::String
+                    | InstanceType::Number
+                    | InstanceType::Integer
+                    | InstanceType::Boolean
+                    | InstanceType::Null
+            )
+        }
+
+        // Reference to another schema - resolve and check
+        Schema::Object(SchemaObject {
+            reference: Some(ref_str),
+            instance_type: None,
+            enum_values: None,
+            subschemas: None,
+            ..
+        }) => {
+            if let Some(resolved) = resolve_reference(ref_str, definitions) {
+                schema_is_non_flattenable(resolved, definitions)
+            } else {
+                false // Conservative: assume flattenable if can't resolve
+            }
+        }
+
+        // OneOf/AnyOf containing only non-flattenable schemas
+        Schema::Object(SchemaObject {
+            subschemas: Some(sub),
+            instance_type: None,
+            object: None,
+            ..
+        }) => {
+            let schemas = sub
+                .one_of
+                .as_ref()
+                .or(sub.any_of.as_ref())
+                .map(|s| s.as_slice());
+
+            if let Some(schemas) = schemas {
+                schemas
+                    .iter()
+                    .all(|s| schema_is_non_flattenable(resolve(s, definitions), definitions))
+            } else {
+                false
+            }
+        }
+
+        _ => false, // Conservative: assume flattenable for complex schemas
+    }
+}
+
+/// Resolve a $ref string to a schema in definitions
+fn resolve_reference<'a>(
+    ref_str: &str,
+    definitions: &'a BTreeMap<RefKey, Schema>,
+) -> Option<&'a Schema> {
+    let key = crate::util::ref_key(ref_str);
+    definitions.get(&key)
+}
+
 /// This function needs to necessarily be conservative. We'd much prefer a
 /// false negative than a false positive.
 fn schemas_mutually_exclusive(
