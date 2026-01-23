@@ -326,7 +326,7 @@ impl TypeSpace {
                         None => format!("subtype_{}", idx),
                     }
                 };
-                
+
                 // Convert to snake_case for field name
                 use heck::ToSnakeCase;
                 let name = field_name.to_snake_case();
@@ -496,9 +496,10 @@ fn has_default(
             StructPropertyState::Optional
         }
         // Default specified is the same as the implicit default: false
-        (Some(TypeEntryDetails::Boolean), Some(serde_json::Value::Bool(false))) => {
-            StructPropertyState::Optional
-        }
+        (
+            Some(TypeEntryDetails::Boolean | TypeEntryDetails::StringBool),
+            Some(serde_json::Value::Bool(false)),
+        ) => StructPropertyState::Optional,
         // Default specified is the same as the implicit default: 0
         (Some(TypeEntryDetails::Integer(_)), Some(serde_json::Value::Number(n)))
             if n.as_u64() == Some(0) =>

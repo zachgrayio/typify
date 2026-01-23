@@ -198,6 +198,7 @@ pub struct TypeSpace {
     uses_uuid: bool,
     uses_serde_json: bool,
     uses_regress: bool,
+    uses_string_bool: bool,
 
     settings: TypeSpaceSettings,
 
@@ -220,6 +221,7 @@ impl Default for TypeSpace {
             uses_uuid: Default::default(),
             uses_serde_json: Default::default(),
             uses_regress: Default::default(),
+            uses_string_bool: Default::default(),
             settings: Default::default(),
             cache: Default::default(),
             defaults: Default::default(),
@@ -830,22 +832,24 @@ impl TypeSpace {
         // Extract JSON Pointer references and create synthetic definitions
         let defs_map: BTreeMap<RefKey, Schema> = defs.iter().cloned().collect();
         let mut json_pointer_defs = Vec::new();
-        
+
         for (_, schema) in &defs {
             let pointer_refs = util::collect_json_pointer_refs(schema);
             for segments in pointer_refs {
                 let pointer_key = RefKey::JsonPointer(segments.clone());
                 // Check if we haven't already added this pointer
-                if !defs_map.contains_key(&pointer_key) 
-                    && !json_pointer_defs.iter().any(|(k, _)| k == &pointer_key) {
+                if !defs_map.contains_key(&pointer_key)
+                    && !json_pointer_defs.iter().any(|(k, _)| k == &pointer_key)
+                {
                     // Resolve the pointer to get the actual schema
-                    if let Some(resolved_schema) = util::resolve_json_pointer(&segments, &defs_map) {
+                    if let Some(resolved_schema) = util::resolve_json_pointer(&segments, &defs_map)
+                    {
                         json_pointer_defs.push((pointer_key, resolved_schema));
                     }
                 }
             }
         }
-        
+
         defs.extend(json_pointer_defs);
 
         self.add_ref_types_impl(defs)?;
@@ -884,6 +888,11 @@ impl TypeSpace {
     /// Whether the generated code needs `uuid` crate.
     pub fn uses_uuid(&self) -> bool {
         self.uses_uuid
+    }
+
+    /// Whether the generated code uses StringBool (bool that can deserialize from "true"/"false" strings).
+    pub fn uses_string_bool(&self) -> bool {
+        self.uses_string_bool
     }
 
     /// Iterate over all types including those defined in this [TypeSpace] and
@@ -946,6 +955,55 @@ impl TypeSpace {
         self.defaults
             .iter()
             .for_each(|x| output.add_item(output::OutputSpaceMod::Defaults, "", x.into()));
+
+        // Add the string_bool helper module if needed.
+        if self.uses_string_bool {
+            output.add_item(
+                output::OutputSpaceMod::StringBool,
+                "",
+                quote! {
+                    use serde::de::{self, Deserializer, Visitor};
+
+                    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        struct StringBoolVisitor;
+
+                        impl<'de> Visitor<'de> for StringBoolVisitor {
+                            type Value = bool;
+
+                            fn expecting(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+                                formatter.write_str("a boolean or a string containing 'true' or 'false'")
+                            }
+
+                            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+                            where
+                                E: de::Error,
+                            {
+                                Ok(v)
+                            }
+
+                            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                            where
+                                E: de::Error,
+                            {
+                                match v {
+                                    "true" => Ok(true),
+                                    "false" => Ok(false),
+                                    _ => Err(E::custom(format!(
+                                        "expected 'true' or 'false', got '{}'",
+                                        v
+                                    ))),
+                                }
+                            }
+                        }
+
+                        deserializer.deserialize_any(StringBoolVisitor)
+                    }
+                },
+            );
+        }
 
         output.into_stream()
     }
@@ -1124,7 +1182,9 @@ impl Type<'_> {
             })
             | TypeEntryDetails::Integer(name)
             | TypeEntryDetails::Float(name) => TypeDetails::Builtin(name.as_str()),
-            TypeEntryDetails::Boolean => TypeDetails::Builtin("bool"),
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => {
+                TypeDetails::Builtin("bool")
+            }
             TypeEntryDetails::String => TypeDetails::String,
             TypeEntryDetails::JsonValue => TypeDetails::Builtin("::serde_json::Value"),
 

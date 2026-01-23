@@ -7,7 +7,9 @@ use crate::type_entry::{
     EnumTagType, TypeEntry, TypeEntryDetails, TypeEntryEnum, TypeEntryNewtype, TypeEntryStruct,
     Variant, VariantDetails,
 };
-use crate::util::{all_mutually_exclusive, any_schema_is_non_flattenable, ref_key, StringValidator};
+use crate::util::{
+    all_mutually_exclusive, any_schema_is_non_flattenable, ref_key, StringValidator,
+};
 use log::{debug, info};
 use schemars::schema::{
     ArrayValidation, InstanceType, Metadata, ObjectValidation, Schema, SchemaObject, SingleOrVec,
@@ -1466,7 +1468,8 @@ impl TypeSpace {
             // If any subschema is a primitive type (string enum, number, etc.),
             // we cannot use flattened struct because serde's #[serde(flatten)]
             // only works with struct/map-like types. Use untagged enum instead.
-            let type_entry = self.untagged_enum(type_name, original_schema, metadata, subschemas)?;
+            let type_entry =
+                self.untagged_enum(type_name, original_schema, metadata, subschemas)?;
             Ok((type_entry, metadata))
         } else {
             // We'll want to build a struct that looks like this:
@@ -1778,13 +1781,13 @@ impl TypeSpace {
                         ..Default::default()
                     },
                 )?;
-                
+
                 let type_id = self.assign_type(type_entry);
                 let pattern = string_validation.pattern.clone().unwrap();
-                
+
                 // Mark that we use regress for pattern matching
                 self.uses_regress = true;
-                
+
                 let newtype_entry = TypeEntryNewtype::from_metadata_with_deny_pattern(
                     self,
                     type_name,
@@ -1793,7 +1796,7 @@ impl TypeSpace {
                     pattern,
                     original_schema.clone(),
                 );
-                
+
                 Ok((newtype_entry, metadata))
             }
 
@@ -2090,16 +2093,33 @@ impl TypeSpace {
                     ))
                 }
                 (1, None) => unreachable!(),
+
+                // Check for StringBool pattern: enum with bool values and their
+                // string representations (e.g., [true, false, "true", "false"])
+                // This is common in YAML-based schemas for flexible boolean input.
+                (2, _)
+                    if instance_types.contains(&InstanceType::Boolean)
+                        && instance_types.contains(&InstanceType::String)
+                        && enum_values.iter().all(|v| match v {
+                            serde_json::Value::Bool(_) => true,
+                            serde_json::Value::String(s) => s == "true" || s == "false",
+                            _ => false,
+                        }) =>
+                {
+                    self.uses_string_bool = true;
+                    Ok((TypeEntryDetails::StringBool.into(), metadata))
+                }
+
                 _ => {
                     // We have multiple types in the enum values. Create an
                     // untagged enum with a variant for each type.
-                    
+
                     // Group enum values by their type
                     let mut values_by_type: std::collections::HashMap<
                         InstanceType,
                         Vec<serde_json::Value>,
                     > = std::collections::HashMap::new();
-                    
+
                     for value in enum_values {
                         let instance_type = match value {
                             serde_json::Value::Null => InstanceType::Null,
@@ -2114,18 +2134,15 @@ impl TypeSpace {
                             .or_insert_with(Vec::new)
                             .push(value.clone());
                     }
-                    
+
                     // Create subschemas for each type with their enum values
                     let subschemas = instance_types
                         .iter()
                         .map(|it| {
-                            let instance_type = Some(schemars::schema::SingleOrVec::Single(
-                                Box::new(*it),
-                            ));
-                            let enum_values = values_by_type
-                                .get(it)
-                                .map(|vals| vals.clone());
-                            
+                            let instance_type =
+                                Some(schemars::schema::SingleOrVec::Single(Box::new(*it)));
+                            let enum_values = values_by_type.get(it).map(|vals| vals.clone());
+
                             let (label, inner_schema) = match it {
                                 InstanceType::Null => (
                                     "null",
@@ -2184,24 +2201,22 @@ impl TypeSpace {
                                     },
                                 ),
                             };
-                            
+
                             // Make the wrapping schema.
                             Schema::Object(schemars::schema::SchemaObject {
                                 metadata: Some(Box::new(schemars::schema::Metadata {
                                     title: Some(label.to_string()),
                                     ..Default::default()
                                 })),
-                                subschemas: Some(Box::new(
-                                    schemars::schema::SubschemaValidation {
-                                        all_of: Some(vec![inner_schema.into()]),
-                                        ..Default::default()
-                                    },
-                                )),
+                                subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                                    all_of: Some(vec![inner_schema.into()]),
+                                    ..Default::default()
+                                })),
                                 ..Default::default()
                             })
                         })
                         .collect::<Vec<_>>();
-                    
+
                     let type_entry =
                         self.untagged_enum(type_name, original_schema, metadata, &subschemas)?;
                     Ok((type_entry, metadata))
@@ -2469,5 +2484,52 @@ mod tests {
         let actual = typ.ident();
         let expected = quote! { not::a::real::library::Uuid };
         assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_string_bool_pattern() {
+        // Test the StringBool pattern: enum with bool values and their string representations
+        // This is common in YAML-based schemas where true/false can come as strings
+        let schema_json = r#"
+        {
+            "title": "TestEnum",
+            "anyOf": [
+                {
+                    "enum": [true, false, "true", "false"]
+                },
+                {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            ]
+        }
+        "#;
+
+        let schema: RootSchema = serde_json::from_str(schema_json).unwrap();
+
+        let mut type_space = TypeSpace::default();
+        let _ = type_space.add_type(&schema.schema.into()).unwrap();
+
+        // Verify that uses_string_bool was set
+        assert!(type_space.uses_string_bool());
+
+        let actual = type_space.to_stream();
+        let actual_str = actual.to_string();
+
+        // The generated code should include the string_bool module
+        assert!(
+            actual_str.contains("string_bool"),
+            "Generated code should include string_bool module"
+        );
+
+        // The generated code should use deserialize_with for the boolean variant
+        assert!(
+            actual_str.contains("deserialize_with"),
+            "Generated code should use deserialize_with attribute"
+        );
+
+        // Parse and verify it's valid Rust
+        let file = syn::parse2::<syn::File>(actual).expect("should emit valid Rust");
+        assert!(!file.items.is_empty(), "should have items");
     }
 }

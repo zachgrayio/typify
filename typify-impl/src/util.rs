@@ -650,22 +650,21 @@ pub(crate) fn ref_key(ref_name: &str) -> RefKey {
     if ref_name == "#" {
         return RefKey::Root;
     }
-    
+
     // Parse the full path: #/definitions/blockStep/properties/key
     // or #/components/schemas/Foo
     // or #/$defs/Foo (newer JSON Schema drafts)
-    let path_str = ref_name.strip_prefix("#/").unwrap_or_else(|| {
-        panic!("expected $ref to start with '#/': {}", ref_name)
-    });
-    
-    let segments: Vec<String> = path_str
-        .split('/')
-        .map(decode_segment)
-        .collect();
-    
+    let path_str = ref_name
+        .strip_prefix("#/")
+        .unwrap_or_else(|| panic!("expected $ref to start with '#/': {}", ref_name));
+
+    let segments: Vec<String> = path_str.split('/').map(decode_segment).collect();
+
     // Check if this is a simple definition reference (backward compatibility)
     // Handles #/definitions/Foo, #/components/schemas/Foo, #/$defs/Foo, and #/defs/Foo
-    if segments.len() == 2 && (segments[0] == "definitions" || segments[0] == "$defs" || segments[0] == "defs") {
+    if segments.len() == 2
+        && (segments[0] == "definitions" || segments[0] == "$defs" || segments[0] == "defs")
+    {
         RefKey::Def(segments[1].clone())
     } else if segments.len() == 3 && segments[0] == "components" && segments[1] == "schemas" {
         // Map #/components/schemas/Foo to definitions/Foo
@@ -687,20 +686,20 @@ pub(crate) fn resolve_json_pointer<'a>(
     if segments.is_empty() || segments[0] != "definitions" {
         return None;
     }
-    
+
     // Second segment is the definition name
     if segments.len() < 2 {
         return None;
     }
-    
+
     let def_key = RefKey::Def(segments[1].clone());
     let mut current_schema = definitions.get(&def_key)?;
-    
+
     // Traverse the remaining segments
     let mut index = 2;
     while index < segments.len() {
         let segment = &segments[index];
-        
+
         match current_schema {
             Schema::Object(schema_obj) => {
                 if segment == "properties" {
@@ -710,7 +709,7 @@ pub(crate) fn resolve_json_pointer<'a>(
                     }
                     index += 1;
                     let prop_name = &segments[index];
-                    
+
                     let properties = &schema_obj.object.as_ref()?.properties;
                     current_schema = properties.get(prop_name)?;
                 } else {
@@ -720,10 +719,10 @@ pub(crate) fn resolve_json_pointer<'a>(
             }
             _ => return None,
         }
-        
+
         index += 1;
     }
-    
+
     Some(current_schema.clone())
 }
 
@@ -745,7 +744,7 @@ fn collect_json_pointer_refs_impl(schema: &Schema, refs: &mut Vec<Vec<String>>) 
                     refs.push(segments);
                 }
             }
-            
+
             // Traverse subschemas
             if let Some(subschemas) = &schema_obj.subschemas {
                 if let Some(all_of) = &subschemas.all_of {
@@ -767,7 +766,7 @@ fn collect_json_pointer_refs_impl(schema: &Schema, refs: &mut Vec<Vec<String>>) 
                     collect_json_pointer_refs_impl(not, refs);
                 }
             }
-            
+
             // Traverse object properties
             if let Some(object) = &schema_obj.object {
                 for schema in object.properties.values() {
@@ -780,7 +779,7 @@ fn collect_json_pointer_refs_impl(schema: &Schema, refs: &mut Vec<Vec<String>>) 
                     collect_json_pointer_refs_impl(schema, refs);
                 }
             }
-            
+
             // Traverse array items
             if let Some(array) = &schema_obj.array {
                 if let Some(items) = &array.items {
@@ -887,6 +886,31 @@ pub(crate) fn schema_is_named(schema: &Schema) -> Option<String> {
             (InstanceType::Object, _) => Some("Object".to_string()),
             (InstanceType::Null, _) => Some("Null".to_string()),
         },
+
+        // StringBool pattern: enum with bool values and their string representations
+        // e.g., [true, false, "true", "false"] - common in YAML-based schemas
+        Schema::Object(SchemaObject {
+            metadata: _,
+            instance_type: None,
+            format: None,
+            enum_values: Some(values),
+            const_value: None,
+            subschemas: None,
+            number: None,
+            string: None,
+            array: None,
+            object: None,
+            reference: None,
+            extensions: _,
+        }) if values.iter().all(|v| match v {
+            serde_json::Value::Bool(_) => true,
+            serde_json::Value::String(s) => s == "true" || s == "false",
+            _ => false,
+        }) && values.iter().any(|v| v.is_boolean())
+            && values.iter().any(|v| v.is_string()) =>
+        {
+            Some("Boolean".to_string())
+        }
 
         _ => None,
     }?;

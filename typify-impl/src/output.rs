@@ -16,6 +16,7 @@ pub enum OutputSpaceMod {
     Crate,
     Builder,
     Defaults,
+    StringBool,
 }
 
 impl OutputSpace {
@@ -63,6 +64,12 @@ impl OutputSpace {
             OutputSpaceMod::Error => quote! {
                 /// Error types.
                 pub mod error {
+                    #items
+                }
+            },
+            OutputSpaceMod::StringBool => quote! {
+                /// Support for deserializing bools from "true"/"false" strings.
+                pub mod string_bool {
                     #items
                 }
             },
