@@ -155,7 +155,7 @@ impl TypeEntry {
                     ::serde_json::from_str::<::serde_json::Value>(#text).unwrap()
                 }
             }
-            TypeEntryDetails::Boolean => {
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => {
                 let v = value.as_bool()?;
                 quote! { #v }
             }

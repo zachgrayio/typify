@@ -58,6 +58,104 @@ pub(crate) fn all_mutually_exclusive(
         })
 }
 
+/// Check if any of the subschemas would generate a non-flattenable type.
+///
+/// Serde's `#[serde(flatten)]` attribute only works correctly for struct/map-like
+/// types. Primitive types like string enums, numbers, booleans cannot be flattened.
+/// When an `anyOf` contains such types, we should use an untagged enum instead of
+/// a struct with flattened fields.
+pub(crate) fn any_schema_is_non_flattenable(
+    subschemas: &[Schema],
+    definitions: &BTreeMap<RefKey, Schema>,
+) -> bool {
+    subschemas
+        .iter()
+        .any(|schema| schema_is_non_flattenable(resolve(schema, definitions), definitions))
+}
+
+/// Check if a schema would generate a type that cannot be flattened with serde.
+/// Returns true for primitive types (strings, numbers, booleans, string enums).
+fn schema_is_non_flattenable(schema: &Schema, definitions: &BTreeMap<RefKey, Schema>) -> bool {
+    match schema {
+        Schema::Bool(_) => false, // Schema::Bool(true) matches any, false matches none
+
+        // String enum (e.g., stringWaitStep) - check this BEFORE the general primitive case
+        Schema::Object(SchemaObject {
+            instance_type: Some(SingleOrVec::Single(instance_type)),
+            enum_values: Some(_),
+            object: None,
+            subschemas: None,
+            ..
+        }) if instance_type.as_ref() == &InstanceType::String => true,
+
+        // General primitive types without object structure cannot be flattened
+        Schema::Object(SchemaObject {
+            instance_type: Some(SingleOrVec::Single(instance_type)),
+            object: None,
+            subschemas: None,
+            ..
+        }) => {
+            // Primitive types without object structure cannot be flattened
+            matches!(
+                instance_type.as_ref(),
+                InstanceType::String
+                    | InstanceType::Number
+                    | InstanceType::Integer
+                    | InstanceType::Boolean
+                    | InstanceType::Null
+            )
+        }
+
+        // Reference to another schema - resolve and check
+        Schema::Object(SchemaObject {
+            reference: Some(ref_str),
+            instance_type: None,
+            enum_values: None,
+            subschemas: None,
+            ..
+        }) => {
+            if let Some(resolved) = resolve_reference(ref_str, definitions) {
+                schema_is_non_flattenable(resolved, definitions)
+            } else {
+                false // Conservative: assume flattenable if can't resolve
+            }
+        }
+
+        // OneOf/AnyOf containing only non-flattenable schemas
+        Schema::Object(SchemaObject {
+            subschemas: Some(sub),
+            instance_type: None,
+            object: None,
+            ..
+        }) => {
+            let schemas = sub
+                .one_of
+                .as_ref()
+                .or(sub.any_of.as_ref())
+                .map(|s| s.as_slice());
+
+            if let Some(schemas) = schemas {
+                schemas
+                    .iter()
+                    .all(|s| schema_is_non_flattenable(resolve(s, definitions), definitions))
+            } else {
+                false
+            }
+        }
+
+        _ => false, // Conservative: assume flattenable for complex schemas
+    }
+}
+
+/// Resolve a $ref string to a schema in definitions
+fn resolve_reference<'a>(
+    ref_str: &str,
+    definitions: &'a BTreeMap<RefKey, Schema>,
+) -> Option<&'a Schema> {
+    let key = crate::util::ref_key(ref_str);
+    definitions.get(&key)
+}
+
 /// This function needs to necessarily be conservative. We'd much prefer a
 /// false negative than a false positive.
 fn schemas_mutually_exclusive(
@@ -550,13 +648,157 @@ fn decode_segment(segment: &str) -> String {
 
 pub(crate) fn ref_key(ref_name: &str) -> RefKey {
     if ref_name == "#" {
-        RefKey::Root
-    } else if let Some(idx) = ref_name.rfind('/') {
-        let decoded_segment = decode_segment(&ref_name[idx + 1..]);
+        return RefKey::Root;
+    }
 
-        RefKey::Def(decoded_segment)
+    // Parse the full path: #/definitions/blockStep/properties/key
+    // or #/components/schemas/Foo
+    // or #/$defs/Foo (newer JSON Schema drafts)
+    let path_str = ref_name
+        .strip_prefix("#/")
+        .unwrap_or_else(|| panic!("expected $ref to start with '#/': {}", ref_name));
+
+    let segments: Vec<String> = path_str.split('/').map(decode_segment).collect();
+
+    // Check if this is a simple definition reference (backward compatibility)
+    // Handles #/definitions/Foo, #/components/schemas/Foo, #/$defs/Foo, and #/defs/Foo
+    if segments.len() == 2
+        && (segments[0] == "definitions" || segments[0] == "$defs" || segments[0] == "defs")
+    {
+        RefKey::Def(segments[1].clone())
+    } else if segments.len() == 3 && segments[0] == "components" && segments[1] == "schemas" {
+        // Map #/components/schemas/Foo to definitions/Foo
+        RefKey::Def(segments[2].clone())
+    } else if segments.len() > 2 {
+        RefKey::JsonPointer(segments)
     } else {
-        panic!("expected a '/' in $ref: {}", ref_name)
+        panic!("unexpected $ref format: {}", ref_name)
+    }
+}
+
+/// Resolve a JSON Pointer path to a schema within the definitions.
+/// For example: ["definitions", "blockStep", "properties", "key"]
+pub(crate) fn resolve_json_pointer<'a>(
+    segments: &[String],
+    definitions: &'a std::collections::BTreeMap<RefKey, Schema>,
+) -> Option<Schema> {
+    // First segment should be "definitions"
+    if segments.is_empty() || segments[0] != "definitions" {
+        return None;
+    }
+
+    // Second segment is the definition name
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let def_key = RefKey::Def(segments[1].clone());
+    let mut current_schema = definitions.get(&def_key)?;
+
+    // Traverse the remaining segments
+    let mut index = 2;
+    while index < segments.len() {
+        let segment = &segments[index];
+
+        match current_schema {
+            Schema::Object(schema_obj) => {
+                if segment == "properties" {
+                    // Next segment should be a property name
+                    if index + 1 >= segments.len() {
+                        return None;
+                    }
+                    index += 1;
+                    let prop_name = &segments[index];
+
+                    let properties = &schema_obj.object.as_ref()?.properties;
+                    current_schema = properties.get(prop_name)?;
+                } else {
+                    // Handle other possible segments if needed
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        index += 1;
+    }
+
+    Some(current_schema.clone())
+}
+
+/// Collect all JSON Pointer references from a schema tree
+pub(crate) fn collect_json_pointer_refs(schema: &Schema) -> Vec<Vec<String>> {
+    let mut refs = Vec::new();
+    collect_json_pointer_refs_impl(schema, &mut refs);
+    refs
+}
+
+fn collect_json_pointer_refs_impl(schema: &Schema, refs: &mut Vec<Vec<String>>) {
+    match schema {
+        Schema::Bool(_) => {}
+        Schema::Object(schema_obj) => {
+            // Check if this schema is a reference
+            if let Some(ref_name) = &schema_obj.reference {
+                let key = ref_key(ref_name);
+                if let RefKey::JsonPointer(segments) = key {
+                    refs.push(segments);
+                }
+            }
+
+            // Traverse subschemas
+            if let Some(subschemas) = &schema_obj.subschemas {
+                if let Some(all_of) = &subschemas.all_of {
+                    for s in all_of {
+                        collect_json_pointer_refs_impl(s, refs);
+                    }
+                }
+                if let Some(any_of) = &subschemas.any_of {
+                    for s in any_of {
+                        collect_json_pointer_refs_impl(s, refs);
+                    }
+                }
+                if let Some(one_of) = &subschemas.one_of {
+                    for s in one_of {
+                        collect_json_pointer_refs_impl(s, refs);
+                    }
+                }
+                if let Some(not) = &subschemas.not {
+                    collect_json_pointer_refs_impl(not, refs);
+                }
+            }
+
+            // Traverse object properties
+            if let Some(object) = &schema_obj.object {
+                for schema in object.properties.values() {
+                    collect_json_pointer_refs_impl(schema, refs);
+                }
+                if let Some(additional) = &object.additional_properties {
+                    collect_json_pointer_refs_impl(additional, refs);
+                }
+                for schema in object.pattern_properties.values() {
+                    collect_json_pointer_refs_impl(schema, refs);
+                }
+            }
+
+            // Traverse array items
+            if let Some(array) = &schema_obj.array {
+                if let Some(items) = &array.items {
+                    match items {
+                        schemars::schema::SingleOrVec::Single(schema) => {
+                            collect_json_pointer_refs_impl(schema, refs);
+                        }
+                        schemars::schema::SingleOrVec::Vec(schemas) => {
+                            for schema in schemas {
+                                collect_json_pointer_refs_impl(schema, refs);
+                            }
+                        }
+                    }
+                }
+                if let Some(additional) = &array.additional_items {
+                    collect_json_pointer_refs_impl(additional, refs);
+                }
+            }
+        }
     }
 }
 
@@ -644,6 +886,31 @@ pub(crate) fn schema_is_named(schema: &Schema) -> Option<String> {
             (InstanceType::Object, _) => Some("Object".to_string()),
             (InstanceType::Null, _) => Some("Null".to_string()),
         },
+
+        // StringBool pattern: enum with bool values and their string representations
+        // e.g., [true, false, "true", "false"] - common in YAML-based schemas
+        Schema::Object(SchemaObject {
+            metadata: _,
+            instance_type: None,
+            format: None,
+            enum_values: Some(values),
+            const_value: None,
+            subschemas: None,
+            number: None,
+            string: None,
+            array: None,
+            object: None,
+            reference: None,
+            extensions: _,
+        }) if values.iter().all(|v| match v {
+            serde_json::Value::Bool(_) => true,
+            serde_json::Value::String(s) => s == "true" || s == "false",
+            _ => false,
+        }) && values.iter().any(|v| v.is_boolean())
+            && values.iter().any(|v| v.is_string()) =>
+        {
+            Some("Boolean".to_string())
+        }
 
         _ => None,
     }?;

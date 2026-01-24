@@ -278,7 +278,7 @@ impl TypeEntry {
                 Ok(DefaultKind::Specific)
             }
             TypeEntryDetails::JsonValue => Ok(DefaultKind::Specific),
-            TypeEntryDetails::Boolean => match default {
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => match default {
                 serde_json::Value::Bool(false) => Ok(DefaultKind::Intrinsic),
                 serde_json::Value::Bool(true) => Ok(DefaultKind::Generic(DefaultImpl::Boolean)),
                 _ => Err(Error::invalid_value()),
@@ -335,7 +335,9 @@ impl TypeEntry {
         let maybe_builtin = match &self.details {
             // This can only be covered by the intrinsic default
             TypeEntryDetails::Unit => unreachable!(),
-            TypeEntryDetails::Boolean => Some("defaults::default_bool::<true>".to_string()),
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => {
+                Some("defaults::default_bool::<true>".to_string())
+            }
             TypeEntryDetails::Integer(name) => {
                 if let Some(value) = default.as_u64() {
                     if name.starts_with(STD_NUM_NONZERO_PREFIX) {

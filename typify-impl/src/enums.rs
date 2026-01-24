@@ -765,15 +765,19 @@ pub(crate) fn output_variant(
             #variant_name,
         },
         VariantDetails::Item(type_id) => {
-            let item_type_ident = type_space
-                .id_to_entry
-                .get(type_id)
-                .unwrap()
-                .type_ident(type_space, &None);
+            let item_type_entry = type_space.id_to_entry.get(type_id).unwrap();
+            let item_type_ident = item_type_entry.type_ident(type_space, &None);
+
+            // Check if this is a StringBool type that needs a custom deserializer
+            let string_bool_serde = matches!(item_type_entry.details, TypeEntryDetails::StringBool)
+                .then(|| {
+                    quote! { #[serde(deserialize_with = "string_bool::deserialize")] }
+                });
 
             quote! {
                 #doc
                 #serde
+                #string_bool_serde
                 #variant_name(#item_type_ident),
             }
         }

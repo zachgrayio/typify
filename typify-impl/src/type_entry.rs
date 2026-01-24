@@ -85,6 +85,7 @@ pub(crate) enum TypeEntryNewtypeConstraints {
     None,
     EnumValue(Vec<WrappedValue>),
     DenyValue(Vec<WrappedValue>),
+    DenyPattern(String), // Pattern that values must NOT match
     String {
         max_length: Option<u32>,
         min_length: Option<u32>,
@@ -159,6 +160,8 @@ pub(crate) enum TypeEntryDetails {
     Tuple(Vec<TypeId>),
     Unit,
     Boolean,
+    /// Boolean that can be deserialized from bool or "true"/"false" strings
+    StringBool,
     /// Integers
     Integer(String),
     /// Floating point numbers; not Eq, Ord, or Hash
@@ -494,6 +497,36 @@ impl TypeEntryNewtype {
         }
     }
 
+    pub(crate) fn from_metadata_with_deny_pattern(
+        type_space: &TypeSpace,
+        type_name: Name,
+        metadata: &Option<Box<Metadata>>,
+        type_id: TypeId,
+        pattern: String,
+        schema: Schema,
+    ) -> TypeEntry {
+        let name = get_type_name(&type_name, metadata).unwrap();
+        let rename = None;
+        let description = metadata_description(metadata);
+
+        let (name, extra_derives) = type_patch(type_space, name);
+
+        let details = TypeEntryDetails::Newtype(Self {
+            name,
+            rename,
+            description,
+            default: None,
+            type_id,
+            constraints: TypeEntryNewtypeConstraints::DenyPattern(pattern),
+            schema: SchemaWrapper(schema),
+        });
+
+        TypeEntry {
+            details,
+            extra_derives,
+        }
+    }
+
     pub(crate) fn from_metadata_with_string_validation(
         type_space: &TypeSpace,
         type_name: Name,
@@ -697,7 +730,7 @@ impl TypeEntry {
                 }
             }
 
-            TypeEntryDetails::Boolean => match impl_name {
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => match impl_name {
                 TypeSpaceImpl::Default | TypeSpaceImpl::FromStr | TypeSpaceImpl::Display => true,
                 TypeSpaceImpl::FromStringIrrefutable => false,
             },
@@ -1521,6 +1554,52 @@ impl TypeEntry {
                 }
             }
 
+            TypeEntryNewtypeConstraints::DenyPattern(pattern) => {
+                // We're going to impl Deserialize so we can remove it
+                // from the set of derived impls.
+                derive_set.remove("::serde::Deserialize");
+
+                quote! {
+                    // This is effectively the constructor for this type.
+                    impl ::std::convert::TryFrom<#inner_type_name> for #type_name {
+                        type Error = self::error::ConversionError;
+
+                        fn try_from(
+                            value: #inner_type_name
+                        ) -> ::std::result::Result<Self, self::error::ConversionError>
+                        {
+                            // Check if the value matches the excluded pattern
+                            let pattern = regress::Regex::new(#pattern)
+                                .map_err(|e| format!("Invalid regex pattern: {}", e))?;
+
+                            if pattern.find(&value).is_some() {
+                                Err("value matches excluded pattern".into())
+                            } else {
+                                Ok(Self(value))
+                            }
+                        }
+                    }
+
+                    impl<'de> ::serde::Deserialize<'de> for #type_name {
+                        fn deserialize<D>(
+                            deserializer: D,
+                        ) -> ::std::result::Result<Self, D::Error>
+                        where
+                            D: ::serde::Deserializer<'de>,
+                        {
+                            Self::try_from(
+                                <#inner_type_name>::deserialize(deserializer)?,
+                            )
+                            .map_err(|e| {
+                                <D::Error as ::serde::de::Error>::custom(
+                                    e.to_string(),
+                                )
+                            })
+                        }
+                    }
+                }
+            }
+
             TypeEntryNewtypeConstraints::String {
                 max_length,
                 min_length,
@@ -1821,7 +1900,7 @@ impl TypeEntry {
 
             TypeEntryDetails::Unit => quote! { () },
             TypeEntryDetails::String => quote! { ::std::string::String },
-            TypeEntryDetails::Boolean => quote! { bool },
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => quote! { bool },
             TypeEntryDetails::JsonValue => quote! { ::serde_json::Value },
             TypeEntryDetails::Integer(name) | TypeEntryDetails::Float(name) => {
                 syn::parse_str::<syn::TypePath>(name)
@@ -1911,6 +1990,7 @@ impl TypeEntry {
 
             TypeEntryDetails::Unit
             | TypeEntryDetails::Boolean
+            | TypeEntryDetails::StringBool
             | TypeEntryDetails::Integer(_)
             | TypeEntryDetails::Float(_) => {
                 self.type_ident(type_space, &type_space.settings.type_mod)
@@ -1950,7 +2030,7 @@ impl TypeEntry {
             TypeEntryDetails::Array(type_id, length) => {
                 format!("array {}; {}", type_id.0, length)
             }
-            TypeEntryDetails::Boolean => "bool".to_string(),
+            TypeEntryDetails::Boolean | TypeEntryDetails::StringBool => "bool".to_string(),
             TypeEntryDetails::Native(TypeEntryNative {
                 type_name: name, ..
             })
